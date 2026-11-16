@@ -1,9 +1,55 @@
+/********************************************************************
+ *                                                                  *
+ * THIS FILE IS PART OF THE OggVorbis SOFTWARE CODEC SOURCE CODE.   *
+ * USE, DISTRIBUTION AND REPRODUCTION OF THIS LIBRARY SOURCE IS     *
+ * GOVERNED BY A BSD-STYLE SOURCE LICENSE INCLUDED WITH THIS SOURCE *
+ * IN 'COPYING'. PLEASE READ THESE TERMS BEFORE DISTRIBUTING.       *
+ *                                                                  *
+ * THE OggVorbis SOURCE CODE IS (C) COPYRIGHT 1994-2015             *
+ * by the Xiph.Org Foundation https://xiph.org/                     *
+ *                                                                  *
+ ********************************************************************
+
+ Adapted ov_bitrate from https://github.com/xiph/vorbis/blob/c2aa86b05e981c96bf381fc6aa11cdd03eccc2fb/lib/vorbisfile.c
+
+Copyright (c) 2002-2020 Xiph.org Foundation
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+- Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+- Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+- Neither the name of the Xiph.org Foundation nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE FOUNDATION
+OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+*/
+
 #include "prx/libSceVorbisDec/include/Api.hpp"
 #include "prx/libSceVorbisDec/include/GuestVorbisFile.hpp"
 #include "prx/libc/include/General.hpp"
 
 #include <vorbis/vorbisfile.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -174,7 +220,23 @@ int APS5_VABI sceVorbisDecClear(void* vf) {
 }
 
 std::int64_t APS5_VABI sceVorbisDecBitrate(void* vf, int link) {
-    return WithHandle(vf, __func__, [&](Handle& handle) -> std::int64_t { return ov_bitrate(&handle.file, link); });
+    return WithHandle(vf, __func__, [&](Handle& handle) -> std::int64_t {
+        OggVorbis_File& file = handle.file;
+        if (file.ready_state < OPENED || !file.seekable || link >= file.links) return ov_bitrate(&file, link);
+        std::int64_t bits = 0;
+        const int first = link < 0 ? 0 : link;
+        const int last = link < 0 ? file.links : link + 1;
+        for (int index = first; index < last; ++index) {
+            const auto bytes = file.offsets[index + 1] - file.dataoffsets[index];
+            if (bytes < 0 || bytes > (std::numeric_limits<std::int64_t>::max() - bits) / 8) NotImplemented_nid_no_patch(__func__);
+            bits += bytes * 8;
+        }
+        double bitrate = static_cast<double>(bits) / ov_time_total(&file, link);
+        if (link < 0) bitrate = static_cast<float>(bitrate);
+        const double rounded = std::rint(bitrate);
+        if (!std::isfinite(rounded) || rounded < -0x1p63 || rounded >= 0x1p63) NotImplemented_nid_no_patch(__func__);
+        return static_cast<std::int64_t>(rounded);
+    });
 }
 
 std::int64_t APS5_VABI sceVorbisDecBitrateInstant(void* vf) {

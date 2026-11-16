@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -211,6 +212,63 @@ void EncodeLink(std::vector<unsigned char>& out, int serial, int channels, long 
     vorbis_dsp_clear(&dsp);
     vorbis_comment_clear(&comment);
     vorbis_info_clear(&info);
+}
+
+void SetBitrateMetadata(std::vector<unsigned char>& bytes, std::uint32_t rate, std::uint64_t samples) {
+    for (std::size_t offset = 0; offset < bytes.size();) {
+        Require(bytes.size() - offset >= 27);
+        auto* header = bytes.data() + offset;
+        Require(std::memcmp(header, "OggS", 4) == 0);
+        const long headerSize = 27 + header[26];
+        Require(bytes.size() - offset >= static_cast<std::size_t>(headerSize));
+        long bodySize = 0;
+        for (int index = 27; index < headerSize; ++index) bodySize += header[index];
+        Require(bytes.size() - offset - headerSize >= static_cast<std::size_t>(bodySize));
+        auto* body = header + headerSize;
+        if (header[5] & 2) {
+            Require(bodySize >= 16 && body[0] == 1 && std::memcmp(body + 1, "vorbis", 6) == 0);
+            for (int index = 0; index < 4; ++index) body[12 + index] = static_cast<unsigned char>(rate >> (index * 8));
+        }
+        if (header[5] & 4) {
+            for (int index = 0; index < 8; ++index) header[6 + index] = static_cast<unsigned char>(samples >> (index * 8));
+        }
+        ogg_page page{header, headerSize, body, bodySize};
+        ogg_page_checksum_set(&page);
+        offset += headerSize + bodySize;
+    }
+}
+
+void TestBitrateRounding() {
+    std::vector<unsigned char> stream;
+    EncodeLink(stream, FirstSerial, 1, FirstRate, FirstSamples, "bitrate");
+    Source referenceSource{&stream};
+    OggVorbis_File reference{};
+    Require(ov_open_callbacks(&referenceSource, &reference, nullptr, 0, HostSeekableCallbacks) == 0);
+    const auto audioBytes = reference.offsets[1] - reference.dataoffsets[0];
+    Require(audioBytes > 0);
+    Require(ov_clear(&reference) == 0);
+    const int savedRounding = std::fegetround();
+    for (const std::uint32_t rate : {44101u, 44103u}) {
+        SetBitrateMetadata(stream, rate, static_cast<std::uint64_t>(audioBytes) * 16);
+        GuestFile guest;
+        Source source{&stream};
+        Require(sceVorbisDecOpenCallbacks(&source, guest.Get(), nullptr, 0, SeekableCallbacks) == 0);
+        Require(sceVorbisDecPcmTotal(guest.Get(), 0) == audioBytes * 16);
+        for (const int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+            Require(std::fesetround(rounding) == 0);
+            const auto expected = static_cast<std::int64_t>(rate / 2 + (rounding == FE_UPWARD || (rounding == FE_TONEAREST && (rate / 2) % 2)));
+            Require(sceVorbisDecBitrate(guest.Get(), -1) == expected);
+        }
+        Require(std::fesetround(savedRounding) == 0);
+        Require(sceVorbisDecClear(guest.Get()) == 0);
+    }
+    SetBitrateMetadata(stream, 1u << 30, static_cast<std::uint64_t>(audioBytes));
+    GuestFile guest;
+    Source source{&stream};
+    Require(sceVorbisDecOpenCallbacks(&source, guest.Get(), nullptr, 0, SeekableCallbacks) == 0);
+    Require(sceVorbisDecBitrate(guest.Get(), 0) == (std::int64_t{1} << 33));
+    Require(sceVorbisDecBitrate(guest.Get(), -1) == (std::int64_t{1} << 33));
+    Require(sceVorbisDecClear(guest.Get()) == 0);
 }
 
 std::int64_t RequireSameRead(void* vf, OggVorbis_File& reference, int bigEndian = 0, int word = 2, int isSigned = 1) {
@@ -604,6 +662,7 @@ int main() {
     EncodeLink(stream, FirstSerial, FirstChannels, FirstRate, FirstSamples, "first");
     EncodeLink(stream, SecondSerial, SecondChannels, SecondRate, SecondSamples, "second");
 
+    TestBitrateRounding();
     TestSeekable(stream);
     TestStreaming(stream);
     TestFloatAndFilter(stream);
